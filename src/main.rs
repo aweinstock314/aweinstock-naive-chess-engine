@@ -88,6 +88,7 @@ impl fmt::Debug for Bitboard {
 
 impl Bitboard {
     fn get(&self, i: u64, j: u64) -> Option<Piece> {
+        assert!(i <= 8 && j <= 8);
         for color in Color::iter() {
             for kind in PieceKind::iter() {
                 if self.boards[color as usize][kind as usize] & (1 << (8 * i + j)) != 0 {
@@ -390,6 +391,9 @@ impl FenRecord {
         for i in 1..8 {
             let x1 = x0 + i * dx;
             let y1 = y0 + i * dy;
+            if x1 < 0 || x1 >= 8 || y1 < 0 || y1 >= 8 {
+                break;
+            }
             self.try_move(result, x0, y0, x1, y1, piece, EnPassant::none());
             if self.board.get(x1 as _, y1 as _).is_some() {
                 break;
@@ -494,7 +498,113 @@ impl FenRecord {
     }
 }
 
+fn alpha_beta<N, F1, F2, F3>(
+    node: &N,
+    depth: usize,
+    mut alpha: f64,
+    mut beta: f64,
+    maximize: bool,
+    valuation: &F1,
+    terminal: &F2,
+    children: &F3,
+) -> (Option<N>, f64)
+where
+    F1: Fn(&N) -> f64,
+    F2: Fn(&N) -> bool,
+    F3: Fn(&N) -> Vec<N>,
+{
+    if depth == 0 || terminal(node) {
+        return (None, valuation(node));
+    }
+    let (neutral, dot, update, better): (
+        f64,
+        fn(f64, f64) -> f64,
+        &dyn Fn(&mut f64, &mut f64, f64),
+        &dyn Fn(f64, f64) -> bool,
+    ) = if maximize {
+        (
+            -std::f64::INFINITY,
+            f64::max,
+            &|a: &mut f64, _, v| {
+                *a = a.max(v);
+            },
+            &|a, b| a >= b,
+        )
+    } else {
+        (
+            std::f64::INFINITY,
+            f64::min,
+            &|_, b: &mut f64, v| {
+                *b = b.min(v);
+            },
+            &|a, b| a <= b,
+        )
+    };
+    let mut value = neutral;
+    let mut best_child = None;
+    for child in children(node) {
+        let (_, child_value) = alpha_beta(
+            &child,
+            depth - 1,
+            alpha,
+            beta,
+            !maximize,
+            valuation,
+            terminal,
+            children,
+        );
+        if better(child_value, value) {
+            best_child = Some(child);
+        }
+        value = dot(value, child_value);
+        update(&mut alpha, &mut beta, value);
+        if alpha >= beta {
+            break;
+        }
+    }
+    (best_child, value)
+}
+
 fn main() {
+    let mut state = FenRecord::from_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1").unwrap();
+    for i in 0..100 {
+        let (next_state, value) = alpha_beta(&state, 7, -std::f64::INFINITY, std::f64::INFINITY, true, &|node| {
+            let mut score = 0.0;
+            for kind in PieceKind::iter() {
+                let multiplier = match kind {
+                    PieceKind::Pawn => 1.0,
+                    PieceKind::Knight => 3.0,
+                    PieceKind::Bishop => 4.0,
+                    PieceKind::Rook => 5.0,
+                    PieceKind::Queen => 9.0,
+                    PieceKind::King => 1000.0,
+                };
+                let subboard = node.board.boards[state.active_color as usize][kind as usize];
+                score += subboard.count_ones() as f64 * multiplier;
+                let subboard = node.board.boards[state.active_color.flip() as usize][kind as usize];
+                score -= subboard.count_ones() as f64 * multiplier;
+            }
+            score
+        },
+        &|node| {
+            node.board.boards[Color::White as usize][PieceKind::King as usize].count_ones() + node.board.boards[Color::Black as usize][PieceKind::King as usize].count_ones() < 2
+        },
+        &|node: &FenRecord| {
+            node.legal_moves()
+        });
+        //println!("{:?} {:?} {:?}", state, next_state, value);
+        if let Some(next_state) = next_state {
+            state = next_state;
+        } else {
+            break;
+        }
+        println!("Turn {} (value {}): {:?}", i, value, state.to_fen());
+        println!("{}", state.board);
+    }
+}
+
+#[test]
+fn test_fen() {
     let examples = [
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
         "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
