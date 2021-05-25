@@ -23,6 +23,12 @@ impl Color {
             Color::Black => "b".to_string(),
         }
     }
+    fn flip(self) -> Self {
+        match self {
+            Color::White => Color::Black,
+            Color::Black => Color::White,
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, EnumIter)]
@@ -169,7 +175,7 @@ impl Display for Bitboard {
                 if let Some(piece) = self.get(x, y) {
                     write!(f, "{}", piece)?;
                 } else {
-                    write!(f, " ")?;
+                    write!(f, ".")?;
                 }
             }
             write!(f, "\n")?;
@@ -178,7 +184,7 @@ impl Display for Bitboard {
     }
 }
 
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug)]
 struct CastleFlags(u8);
 
 impl CastleFlags {
@@ -239,19 +245,16 @@ fn parse_row_and_column(fen: &str) -> Option<(u8, u8)> {
 /// Represents an en passant position as 0bzxxxyyy
 /// - z is set if the en passant square is active
 /// - x and y are 3 bits each
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug)]
 struct EnPassant(u8);
 
 impl EnPassant {
     fn from_fen(fen: &str) -> Option<Self> {
         if fen == "-" {
-            Some(EnPassant(0))
+            Some(Self::none())
         } else {
-            let mut pos = 1 << 7;
             let (x, y) = parse_row_and_column(fen)?;
-            pos |= (x & 7) << 3;
-            pos |= y & 7;
-            Some(EnPassant(pos))
+            Some(Self::from_pos(x, y))
         }
     }
     fn to_fen(&self) -> String {
@@ -263,9 +266,18 @@ impl EnPassant {
             "-".to_string()
         }
     }
+    fn from_pos(x: u8, y: u8) -> Self {
+        let mut pos = 1 << 7;
+        pos |= (x & 7) << 3;
+        pos |= y & 7;
+        EnPassant(pos)
+    }
+    fn none() -> Self {
+        EnPassant(0)
+    }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct FenRecord {
     board: Bitboard,
     active_color: Color,
@@ -310,6 +322,176 @@ impl FenRecord {
         result += &format!("{}", self.fullmove_number);
         result
     }
+    fn try_move(
+        &self,
+        result: &mut Vec<Self>,
+        x0: i8,
+        y0: i8,
+        x1: i8,
+        y1: i8,
+        piece: Piece,
+        en_passant: EnPassant,
+    ) {
+        if x1 < 0 || x1 >= 8 || y1 < 0 || y1 >= 8 {
+            return;
+        }
+        let mut newmove = self.clone();
+        newmove.board.set(x0 as _, y0 as _, None);
+        newmove.active_color = newmove.active_color.flip();
+        newmove.en_passant = en_passant;
+        newmove.halfmove_clock += 1;
+        // The fullmove number increments after black's turn
+        if newmove.active_color == Color::White {
+            newmove.fullmove_number += 1;
+        }
+        // TODO: emulate the existence of a pawn at the old en-passant position for the purposes of capture-checking
+        if let Some(other_piece) = self.board.get(x1 as _, y1 as _) {
+            // can't capture a piece of the same color
+            if piece.color == other_piece.color {
+                return;
+            }
+            // pawns can only capture diagonally
+            if piece.kind == PieceKind::Pawn && x0 == x1 {
+                return;
+            }
+            // captures reset the halfmove clock
+            newmove.halfmove_clock = 0;
+        } else if piece.kind == PieceKind::Pawn && x0 != x1 {
+            // pawns can only move diagonally if they're capturing
+            return;
+        }
+        // pawn movement resets the halfmove clock
+        if piece.kind == PieceKind::Pawn {
+            newmove.halfmove_clock = 0;
+        }
+        let promote_row = match piece.color {
+            Color::White => 0,
+            Color::Black => 7,
+        };
+        if piece.kind == PieceKind::Pawn && y1 == promote_row {
+            for kind in PieceKind::iter() {
+                let mut tmp = newmove.clone();
+                tmp.board.set(
+                    x1 as _,
+                    y1 as _,
+                    Some(Piece {
+                        color: piece.color,
+                        kind,
+                    }),
+                );
+                result.push(tmp);
+            }
+        } else {
+            newmove.board.set(x1 as _, y1 as _, Some(piece));
+            result.push(newmove);
+        }
+    }
+    fn move_ray(&self, result: &mut Vec<Self>, x0: i8, y0: i8, dx: i8, dy: i8, piece: Piece) {
+        for i in 1..8 {
+            let x1 = x0 + i * dx;
+            let y1 = y0 + i * dy;
+            self.try_move(result, x0, y0, x1, y1, piece, EnPassant::none());
+            if self.board.get(x1 as _, y1 as _).is_some() {
+                break;
+            }
+        }
+    }
+    fn moves_for_piece(&self, x: i8, y: i8, piece: Piece) -> Vec<Self> {
+        use {Color::*, PieceKind::*};
+        let mut result = Vec::new();
+        match piece.kind {
+            Pawn => {
+                let ydir = match piece.color {
+                    White => -1,
+                    Black => 1,
+                };
+                let orig_row = match piece.color {
+                    White => 6,
+                    Black => 1,
+                };
+                self.try_move(&mut result, x, y, x, y + ydir, piece, EnPassant::none());
+                self.try_move(&mut result, x, y, x - 1, y + ydir, piece, EnPassant::none());
+                self.try_move(&mut result, x, y, x + 1, y + ydir, piece, EnPassant::none());
+                if y == orig_row {
+                    self.try_move(
+                        &mut result,
+                        x,
+                        y,
+                        x,
+                        y + 2 * ydir,
+                        piece,
+                        EnPassant::from_pos(x as u8, (y + ydir) as u8),
+                    );
+                }
+            }
+            Knight => {
+                for i in -2i8..=2 {
+                    for j in -2i8..=2 {
+                        if (i.abs() == 2 && j.abs() == 1) || (i.abs() == 1 && j.abs() == 2) {
+                            self.try_move(
+                                &mut result,
+                                x,
+                                y,
+                                x + i,
+                                y + j,
+                                piece,
+                                EnPassant::none(),
+                            );
+                        }
+                    }
+                }
+            }
+            Bishop => {
+                for i in [-1, 1].iter() {
+                    for j in [-1, 1].iter() {
+                        self.move_ray(&mut result, x, y, *i, *j, piece);
+                    }
+                }
+            }
+            Rook => {
+                for i in [-1, 1].iter() {
+                    self.move_ray(&mut result, x, y, *i, 0, piece);
+                    self.move_ray(&mut result, x, y, 0, *i, piece);
+                }
+            }
+            Queen => {
+                for i in -1..=1 {
+                    for j in -1..=1 {
+                        if i == 0 && j == 0 {
+                            continue;
+                        }
+                        self.move_ray(&mut result, x, y, i, j, piece);
+                    }
+                }
+            }
+            King => {
+                for i in -1..=1 {
+                    for j in -1..=1 {
+                        if i == 0 && j == 0 {
+                            continue;
+                        }
+                        // TODO: castling
+                        self.try_move(&mut result, x, y, x + i, y + j, piece, EnPassant::none());
+                    }
+                }
+            }
+        }
+        result
+    }
+    fn legal_moves(&self) -> Vec<Self> {
+        let mut result = Vec::new();
+        for x in 0..8 {
+            for y in 0..8 {
+                if let Some(piece) = self.board.get(x, y) {
+                    if piece.color != self.active_color {
+                        continue;
+                    }
+                    result.extend(self.moves_for_piece(x as _, y as _, piece));
+                }
+            }
+        }
+        result
+    }
 }
 
 fn main() {
@@ -318,10 +500,19 @@ fn main() {
         "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
         "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq c6 0 2",
         "rnbqkbnr/pp1ppppp/8/2p5/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq - 1 2",
+        "8/4k3/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 0",
+        "8/4q3/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 0",
+        "8/4n3/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 0",
+        "8/4r3/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 0",
+        "8/4b3/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 0",
     ];
     for example in examples.iter() {
         let record = FenRecord::from_fen(example).unwrap();
         println!("{:?}", record);
+        for newmove in record.legal_moves() {
+            println!("\t{:?}", newmove.to_fen());
+            //println!("{}", newmove.board);
+        }
         assert_eq!(example, &&record.to_fen());
     }
 }
