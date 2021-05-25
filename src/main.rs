@@ -58,6 +58,9 @@ impl Piece {
         }
         None
     }
+    fn to_fen(&self) -> String {
+        format!("{}", FEN_PIECES[self.color as usize][self.kind as usize])
+    }
 }
 
 impl Display for Piece {
@@ -66,9 +69,15 @@ impl Display for Piece {
     }
 }
 
-#[derive(Copy, Clone, Debug, Default)]
+#[derive(Copy, Clone, Default)]
 struct Bitboard {
     boards: [[u64; 6]; 2],
+}
+
+impl fmt::Debug for Bitboard {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:?}", self.to_fen())
+    }
 }
 
 impl Bitboard {
@@ -125,6 +134,31 @@ impl Bitboard {
             }
         }
         Some(board)
+    }
+
+    fn to_fen(&self) -> String {
+        let mut result = String::new();
+        for y in 0..8 {
+            let mut num_spaces = 0;
+            for x in 0..8 {
+                if let Some(piece) = self.get(x, y) {
+                    if num_spaces > 0 {
+                        result += &format!("{}", num_spaces);
+                        num_spaces = 0;
+                    }
+                    result += &piece.to_fen();
+                } else {
+                    num_spaces += 1;
+                }
+            }
+            if num_spaces > 0 {
+                result += &format!("{}", num_spaces);
+            }
+            if y != 7 {
+                result += "/";
+            }
+        }
+        result
     }
 }
 
@@ -263,7 +297,18 @@ impl FenRecord {
         })
     }
     fn to_fen(&self) -> String {
-        String::new()
+        let mut result = String::new();
+        result += &self.board.to_fen();
+        result += " ";
+        result += &self.active_color.to_fen();
+        result += " ";
+        result += &self.castle_flags.to_fen();
+        result += " ";
+        result += &self.en_passant.to_fen();
+        result += " ";
+        result += &format!("{} ", self.halfmove_clock);
+        result += &format!("{}", self.fullmove_number);
+        result
     }
 }
 
@@ -277,5 +322,6 @@ fn main() {
     for example in examples.iter() {
         let record = FenRecord::from_fen(example).unwrap();
         println!("{:?}", record);
+        assert_eq!(example, &&record.to_fen());
     }
 }
